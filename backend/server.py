@@ -1,70 +1,237 @@
-from fastapi import FastAPI, APIRouter
+from fastapi import FastAPI, APIRouter, File, UploadFile, HTTPException
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
-from motor.motor_asyncio import AsyncIOMotorClient
 import os
 import logging
 from pathlib import Path
-from pydantic import BaseModel, Field, ConfigDict
-from typing import List
-import uuid
-from datetime import datetime, timezone
+from typing import List, Optional
+import base64
+from datetime import datetime, timedelta
 
+# Import models and services
+from models import *
+from database import *
+from ai_services import analyze_screenshot, generate_tactical_insights, generate_coding_mentor_feedback
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
 
-# MongoDB connection
-mongo_url = os.environ['MONGO_URL']
-client = AsyncIOMotorClient(mongo_url)
-db = client[os.environ['DB_NAME']]
-
 # Create the main app without a prefix
-app = FastAPI()
+app = FastAPI(title="TacticalGrade API")
 
 # Create a router with the /api prefix
 api_router = APIRouter(prefix="/api")
 
-
-# Define Models
-class StatusCheck(BaseModel):
-    model_config = ConfigDict(extra="ignore")  # Ignore MongoDB's _id field
-    
-    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    client_name: str
-    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
-
-class StatusCheckCreate(BaseModel):
-    client_name: str
+# Default user ID for demo mode
+DEFAULT_USER_ID = "demo-user-001"
 
 # Add your routes to the router instead of directly to app
 @api_router.get("/")
 async def root():
-    return {"message": "Hello World"}
+    return {"message": "TacticalGrade API v1.0"}
 
-@api_router.post("/status", response_model=StatusCheck)
-async def create_status_check(input: StatusCheckCreate):
-    status_dict = input.model_dump()
-    status_obj = StatusCheck(**status_dict)
-    
-    # Convert to dict and serialize datetime to ISO string for MongoDB
-    doc = status_obj.model_dump()
-    doc['timestamp'] = doc['timestamp'].isoformat()
-    
-    _ = await db.status_checks.insert_one(doc)
-    return status_obj
+# ==================== USER ENDPOINTS ====================
 
-@api_router.get("/status", response_model=List[StatusCheck])
-async def get_status_checks():
-    # Exclude MongoDB's _id field from the query results
-    status_checks = await db.status_checks.find({}, {"_id": 0}).to_list(1000)
+@api_router.get("/users/me", response_model=User)
+async def get_current_user():
+    """Get current user profile"""
+    user = await users_collection.find_one({"id": DEFAULT_USER_ID})
+    if not user:
+        # Create default user
+        default_user = User(
+            id=DEFAULT_USER_ID,
+            name="Alex Chen",
+            email="alex.chen@university.edu",
+            avatar="https://api.dicebear.com/7.x/avataaars/svg?seed=Alex",
+            level=12,
+            points=8450,
+            compliance=87,
+            streak=23
+        )
+        await users_collection.insert_one(default_user.dict())
+        return default_user
+    return User(**user)
+
+@api_router.get("/users/{user_id}/stats", response_model=UserStats)
+async def get_user_stats(user_id: str = DEFAULT_USER_ID):
+    """Get user statistics"""
+    total_subjects = await subjects_collection.count_documents({"user_id": user_id})
+    total_tasks = await tasks_collection.count_documents({"user_id": user_id})
+    completed_tasks = await tasks_collection.count_documents({"user_id": user_id, "completed": True})
+    badges_earned = await user_badges_collection.count_documents({"user_id": user_id, "earned": True})
     
-    # Convert ISO string timestamps back to datetime objects
-    for check in status_checks:
-        if isinstance(check['timestamp'], str):
-            check['timestamp'] = datetime.fromisoformat(check['timestamp'])
+    # Calculate average compliance
+    subjects = await subjects_collection.find({"user_id": user_id}).to_list(100)
+    avg_compliance = sum(s.get("compliance", 0) for s in subjects) / len(subjects) if subjects else 0
     
-    return status_checks
+    return UserStats(
+        total_subjects=total_subjects,
+        total_tasks=total_tasks,
+        completed_tasks=completed_tasks,
+        badges_earned=badges_earned,
+        average_compliance=round(avg_compliance, 2)
+    )
+
+# ==================== SUBJECT ENDPOINTS ====================
+
+@api_router.get("/subjects", response_model=List[Subject])
+async def get_subjects(user_id: str = DEFAULT_USER_ID):
+    """List all subjects for user"""
+    subjects = await subjects_collection.find({"user_id": user_id}).to_list(100)
+    return [Subject(**s) for s in subjects]
+
+@api_router.post("/subjects", response_model=Subject)
+async def create_subject(subject_data: SubjectCreate, user_id: str = DEFAULT_USER_ID):
+    """Create new subject"""
+    # Calculate current marks and compliance
+    total_weighted = 0
+    total_weight = 0
+    for comp in subject_data.components:
+        if not comp.pending:
+            total_weighted += (comp.scored / comp.total) * comp.weight
+            total_weight += comp.weight
+    
+    current_marks = (total_weighted / total_weight * 100) if total_weight > 0 else 0
+    compliance = current_marks
+    
+    # Determine status
+    if compliance >= 90:
+        status = StatusEnum.excellent
+    elif compliance >= 85:
+        status = StatusEnum.on_track
+    elif compliance >= 75:
+        status = StatusEnum.at_risk
+    else:
+        status = StatusEnum.critical
+    
+    subject = Subject(
+        user_id=user_id,
+        name=subject_data.name,
+        code=subject_data.code,
+        current_marks=current_marks,
+        total_marks=100,
+        compliance=compliance,
+        status=status,
+        components=subject_data.components
+    )
+    
+    await subjects_collection.insert_one(subject.dict())
+    return subject
+
+@api_router.post("/subjects/{subject_id}/simulate", response_model=SimulationResponse)
+async def simulate_grade(subject_id: str, simulation: SimulationRequest):
+    """Simulate final grade with what-if scores"""
+    subject = await subjects_collection.find_one({"id": subject_id})
+    if not subject:
+        raise HTTPException(status_code=404, detail="Subject not found")
+    
+    subject_obj = Subject(**subject)
+    
+    # Calculate with simulated scores
+    total_weighted = 0
+    total_weight = 0
+    
+    for comp in subject_obj.components:
+        score = simulation.simulated_scores.get(comp.name, comp.scored)
+        total_weighted += (score / comp.total) * comp.weight
+        total_weight += comp.weight
+    
+    predicted_grade = (total_weighted / total_weight * 100) if total_weight > 0 else 0
+    
+    # Determine status
+    if predicted_grade >= 90:
+        status = StatusEnum.excellent
+    elif predicted_grade >= 85:
+        status = StatusEnum.on_track
+    elif predicted_grade >= 75:
+        status = StatusEnum.at_risk
+    else:
+        status = StatusEnum.critical
+    
+    return SimulationResponse(
+        predicted_grade=round(predicted_grade, 2),
+        compliance=round(predicted_grade, 2),
+        status=status
+    )
+
+# ==================== SCREENSHOT ANALYSIS ENDPOINT ====================
+
+@api_router.post("/analysis/screenshot")
+async def analyze_screenshot_endpoint(file: UploadFile = File(...)):
+    """Upload and analyze marks screenshot"""
+    try:
+        # Read file and convert to base64
+        contents = await file.read()
+        image_base64 = base64.b64encode(contents).decode('utf-8')
+        
+        # Analyze with AI
+        result = await analyze_screenshot(image_base64)
+        
+        return result.dict()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Analysis failed: {str(e)}")
+
+# ==================== TASK ENDPOINTS ====================
+
+@api_router.get("/tasks", response_model=List[Task])
+async def get_tasks(user_id: str = DEFAULT_USER_ID):
+    """List all tasks"""
+    tasks = await tasks_collection.find({"user_id": user_id}).to_list(100)
+    return [Task(**t) for t in tasks]
+
+@api_router.post("/tasks", response_model=Task)
+async def create_task(task_data: TaskCreate, user_id: str = DEFAULT_USER_ID):
+    """Create new task"""
+    task = Task(user_id=user_id, **task_data.dict())
+    await tasks_collection.insert_one(task.dict())
+    return task
+
+@api_router.put("/tasks/{task_id}", response_model=Task)
+async def update_task(task_id: str, task_update: TaskUpdate):
+    """Update task"""
+    task = await tasks_collection.find_one({"id": task_id})
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    
+    update_data = {k: v for k, v in task_update.dict().items() if v is not None}
+    await tasks_collection.update_one({"id": task_id}, {"$set": update_data})
+    
+    updated_task = await tasks_collection.find_one({"id": task_id})
+    return Task(**updated_task)
+
+@api_router.post("/tasks/{task_id}/toggle")
+async def toggle_task(task_id: str):
+    """Toggle task completion"""
+    task = await tasks_collection.find_one({"id": task_id})
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    
+    new_status = not task.get("completed", False)
+    await tasks_collection.update_one({"id": task_id}, {"$set": {"completed": new_status}})
+    
+    return {"success": True, "completed": new_status}
+
+@api_router.delete("/tasks/{task_id}")
+async def delete_task(task_id: str):
+    """Delete task"""
+    result = await tasks_collection.delete_one({"id": task_id})
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Task not found")
+    return {"success": True}
+
+# ==================== AI INSIGHTS ENDPOINT ====================
+
+@api_router.get("/insights/tactical", response_model=List[TacticalInsight])
+async def get_tactical_insights(user_id: str = DEFAULT_USER_ID):
+    """Get AI-powered tactical insights"""
+    subjects = await subjects_collection.find({"user_id": user_id}).to_list(100)
+    tasks = await tasks_collection.find({"user_id": user_id, "completed": False}).to_list(100)
+    
+    subjects_data = [s for s in subjects]
+    tasks_data = [t for t in tasks]
+    
+    insights = await generate_tactical_insights(subjects_data, tasks_data)
+    return insights
 
 # Include the router in the main app
 app.include_router(api_router)
@@ -86,4 +253,5 @@ logger = logging.getLogger(__name__)
 
 @app.on_event("shutdown")
 async def shutdown_db_client():
+    from database import client
     client.close()
