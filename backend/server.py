@@ -233,6 +233,130 @@ async def get_tactical_insights(user_id: str = DEFAULT_USER_ID):
     insights = await generate_tactical_insights(subjects_data, tasks_data)
     return insights
 
+# ==================== CHALLENGE ENDPOINTS ====================
+
+@api_router.get("/challenges", response_model=List[Challenge])
+async def get_challenges():
+    """List all coding challenges"""
+    challenges = await challenges_collection.find().to_list(100)
+    return [Challenge(**c) for c in challenges]
+
+@api_router.get("/challenges/{challenge_id}", response_model=Challenge)
+async def get_challenge(challenge_id: str):
+    """Get specific challenge details"""
+    challenge = await challenges_collection.find_one({"id": challenge_id})
+    if not challenge:
+        raise HTTPException(status_code=404, detail="Challenge not found")
+    return Challenge(**challenge)
+
+@api_router.post("/challenges/{challenge_id}/submit")
+async def submit_solution(challenge_id: str, submission_data: dict, user_id: str = DEFAULT_USER_ID):
+    """Submit solution for a challenge"""
+    challenge = await challenges_collection.find_one({"id": challenge_id})
+    if not challenge:
+        raise HTTPException(status_code=404, detail="Challenge not found")
+    
+    # Mock test execution (in real implementation, this would run actual tests)
+    test_results = [
+        {"test_case": 1, "passed": True, "expected": "output1", "actual": "output1"},
+        {"test_case": 2, "passed": True, "expected": "output2", "actual": "output2"},
+        {"test_case": 3, "passed": False, "expected": "output3", "actual": "wrong_output"}
+    ]
+    
+    passed_tests = sum(1 for r in test_results if r["passed"])
+    total_tests = len(test_results)
+    status = "passed" if passed_tests == total_tests else "failed"
+    
+    # Create submission record
+    submission = Submission(
+        user_id=user_id,
+        challenge_id=challenge_id,
+        code=submission_data.get("code", ""),
+        status=status,
+        test_results=test_results
+    )
+    
+    await submissions_collection.insert_one(submission.dict())
+    
+    # Generate AI mentor feedback
+    feedback = await generate_coding_mentor_feedback(submission.code, test_results)
+    
+    return {
+        "submission_id": submission.id,
+        "status": status,
+        "passed_tests": passed_tests,
+        "total_tests": total_tests,
+        "test_results": test_results,
+        "mentor_feedback": feedback
+    }
+
+@api_router.get("/users/{user_id}/submissions")
+async def get_user_submissions(user_id: str = DEFAULT_USER_ID):
+    """Get user's challenge submissions"""
+    submissions = await submissions_collection.find({"user_id": user_id}).to_list(100)
+    return [Submission(**s) for s in submissions]
+
+# ==================== BADGE ENDPOINTS ====================
+
+@api_router.get("/badges", response_model=List[Badge])
+async def get_all_badges():
+    """List all available badges"""
+    badges = await badges_collection.find().to_list(100)
+    return [Badge(**b) for b in badges]
+
+@api_router.get("/users/{user_id}/badges")
+async def get_user_badges(user_id: str = DEFAULT_USER_ID):
+    """Get user's earned badges"""
+    user_badges = await user_badges_collection.find({"user_id": user_id, "earned": True}).to_list(100)
+    
+    # Get badge details
+    badge_ids = [ub["badge_id"] for ub in user_badges]
+    badges = await badges_collection.find({"id": {"$in": badge_ids}}).to_list(100)
+    
+    return [Badge(**b) for b in badges]
+
+# ==================== LEADERBOARD ENDPOINTS ====================
+
+@api_router.get("/leaderboard", response_model=List[LeaderboardEntry])
+async def get_leaderboard(user_id: str = DEFAULT_USER_ID):
+    """Get global leaderboard"""
+    # Get top users by points
+    users = await users_collection.find().sort("points", -1).limit(50).to_list(50)
+    
+    leaderboard = []
+    for rank, user in enumerate(users, 1):
+        # Count solved challenges
+        solved_count = await submissions_collection.count_documents({
+            "user_id": user["id"], 
+            "status": "passed"
+        })
+        
+        leaderboard.append(LeaderboardEntry(
+            rank=rank,
+            name=user["name"],
+            points=user["points"],
+            solved=solved_count,
+            avatar=user["avatar"],
+            is_current_user=(user["id"] == user_id)
+        ))
+    
+    return leaderboard
+
+# ==================== LEGACY TIMELINE ENDPOINTS ====================
+
+@api_router.get("/users/{user_id}/timeline")
+async def get_user_timeline(user_id: str = DEFAULT_USER_ID):
+    """Get user's academic timeline"""
+    timeline = await legacy_timeline_collection.find({"user_id": user_id}).sort("date", -1).to_list(100)
+    return [LegacyEntry(**entry) for entry in timeline]
+
+@api_router.post("/users/{user_id}/timeline")
+async def add_timeline_entry(entry_data: dict, user_id: str = DEFAULT_USER_ID):
+    """Add entry to user's timeline"""
+    entry = LegacyEntry(user_id=user_id, **entry_data)
+    await legacy_timeline_collection.insert_one(entry.dict())
+    return entry
+
 # Include the router in the main app
 app.include_router(api_router)
 
