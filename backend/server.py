@@ -25,6 +25,95 @@ api_router = APIRouter(prefix="/api")
 # Default user ID for demo mode
 DEFAULT_USER_ID = "demo-user-001"
 
+# Initialize sample data on startup
+@app.on_event("startup")
+async def initialize_sample_data():
+    """Initialize sample data for demo"""
+    try:
+        # Check if sample data already exists
+        existing_user = await users_collection.find_one({"id": DEFAULT_USER_ID})
+        if existing_user:
+            return  # Data already initialized
+        
+        # Create sample challenges
+        sample_challenges = [
+            Challenge(
+                id="challenge-001",
+                title="Two Sum Problem",
+                difficulty=DifficultyEnum.easy,
+                points=100,
+                submissions=1247,
+                success_rate=0.73,
+                tags=["arrays", "hash-table"],
+                description="Given an array of integers nums and an integer target, return indices of the two numbers such that they add up to target.",
+                test_cases=3,
+                starter_code="def two_sum(nums, target):\n    # Your code here\n    pass"
+            ),
+            Challenge(
+                id="challenge-002", 
+                title="Binary Tree Traversal",
+                difficulty=DifficultyEnum.medium,
+                points=250,
+                submissions=892,
+                success_rate=0.58,
+                tags=["trees", "recursion"],
+                description="Implement inorder, preorder, and postorder traversal of a binary tree.",
+                test_cases=5,
+                starter_code="class TreeNode:\n    def __init__(self, val=0, left=None, right=None):\n        self.val = val\n        self.left = left\n        self.right = right\n\ndef inorder_traversal(root):\n    # Your code here\n    pass"
+            ),
+            Challenge(
+                id="challenge-003",
+                title="Dynamic Programming: Fibonacci",
+                difficulty=DifficultyEnum.hard,
+                points=500,
+                submissions=456,
+                success_rate=0.34,
+                tags=["dynamic-programming", "optimization"],
+                description="Implement an efficient solution to calculate the nth Fibonacci number using dynamic programming.",
+                test_cases=8,
+                starter_code="def fibonacci(n):\n    # Implement efficient DP solution\n    pass"
+            )
+        ]
+        
+        for challenge in sample_challenges:
+            await challenges_collection.insert_one(challenge.dict())
+        
+        # Create sample badges
+        sample_badges = [
+            Badge(
+                id="badge-001",
+                name="First Steps",
+                icon="🎯",
+                rarity=RarityEnum.common,
+                description="Complete your first challenge",
+                criteria={"challenges_completed": 1}
+            ),
+            Badge(
+                id="badge-002", 
+                name="Problem Solver",
+                icon="🧠",
+                rarity=RarityEnum.rare,
+                description="Solve 10 challenges",
+                criteria={"challenges_completed": 10}
+            ),
+            Badge(
+                id="badge-003",
+                name="Academic Excellence", 
+                icon="🏆",
+                rarity=RarityEnum.epic,
+                description="Maintain 90%+ compliance across all subjects",
+                criteria={"min_compliance": 90}
+            )
+        ]
+        
+        for badge in sample_badges:
+            await badges_collection.insert_one(badge.dict())
+            
+        print("✅ Sample data initialized successfully")
+        
+    except Exception as e:
+        print(f"❌ Error initializing sample data: {e}")
+
 # Add your routes to the router instead of directly to app
 @api_router.get("/")
 async def root():
